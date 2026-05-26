@@ -1200,3 +1200,265 @@ sensitivity <- data.frame(k = c(5, 10, 15),
                                      summary(fit_k15)$s.table["RhythmSR(yindex)","edf"]))
 print(sensitivity, digits = 4)
 
+# classifying -------------------------------------------------------------
+
+kovariantes_valid$bad_rhytmh<-ifelse(kovariantes_valid$Rhythm == 'AFIB', 1, 0)
+kovariantes_valid$bad_rhytmh<-as.factor(kovariantes_valid$bad_rhytmh)
+
+library(caret)
+
+set.seed(123)
+
+idx <- createDataPartition(
+  kovariantes_valid$bad_rhytmh,
+  p = 0.8,
+  list = FALSE
+)
+
+fdata_train <- fdata(fd_beats[idx,])
+fdata_test  <- fdata(fd_beats[-idx,])
+
+y_train <- kovariantes_valid$bad_rhytmh[idx]
+y_test  <- kovariantes_valid$bad_rhytmh[-idx]
+
+kovariantes_subset<-data.frame(Age=kovariantes_valid$PatientAge,
+                               Gender=kovariantes_valid$Gender,
+                               VenticularRate=kovariantes_valid$VentricularRate,
+                               Arti=kovariantes_valid$AtrialRate)
+kovariantes_subset$Gender<-as.factor(kovariantes_subset$Gender)
+kovariantes_subset$Age<-as.numeric(kovariantes_subset$Age)
+kovariantes_subset$VenticularRate<-as.numeric(kovariantes_subset$VenticularRate)
+kovariantes_subset$Arti<-as.numeric(kovariantes_subset$Arti)
+kovariantes_subset_train <- kovariantes_subset[idx,]
+kovariantes_subset_test  <- kovariantes_subset[-idx,]
+library(fda.usc)
+library(pROC)
+
+#---------------------------------
+# data for fda.usc
+#---------------------------------
+
+ldata_train <- ldata(
+  "df"=data.frame(
+    y=y_train,
+    kovariantes_subset_train
+  ),
+  "x"=fdata_train
+)
+
+ldata_test <- ldata(
+  "df"=data.frame(
+    y=y_test,
+    kovariantes_subset_test
+  ),
+  "x"=fdata_test
+)
+
+library(ggplot2)
+
+# -------------------------------------------------
+# Prepare data
+# -------------------------------------------------
+
+ldata_train$df$y <- factor(ldata_train$df$y,
+                           levels = c(0,1))
+
+ldata_test$df$y <- factor(ldata_test$df$y,
+                          levels = c(0,1))
+
+# -------------------------------------------------
+# FPCA basis
+# -------------------------------------------------
+
+basis_pc <- list(
+  x = create.pc.basis(fdata_train, l = 1:3)
+)
+
+# -------------------------------------------------
+# Models
+# -------------------------------------------------
+
+models <- list(
+  
+  
+  LDA = classif.lda(
+    y ~ x + Age + Gender + Arti + VenticularRate,
+    data = ldata_train,
+    basis.x = basis_pc
+  ),
+  
+  QDA = classif.qda(
+    y ~ x + Age + Gender + Arti + VenticularRate,
+    data = ldata_train,
+    basis.x = basis_pc
+  ),
+  
+  RPART = classif.rpart(
+    y ~ x + Age + Gender + Arti + VenticularRate,
+    data = ldata_train,
+    basis.x = basis_pc
+  )
+)
+
+# -------------------------------------------------
+# ROC plot
+# -------------------------------------------------
+
+plot(
+  0,0,
+  type = "n",
+  xlim = c(1,0),
+  ylim = c(0,1),
+  xlab = "False Positive Rate",
+  ylab = "True Positive Rate",
+  main = "ROC curves"
+)
+
+abline(a = 0, b = 1, lty = 2)
+
+colors <- c("red","blue","green","purple","orange")
+
+auc_values <- c()
+
+results <- list()
+
+# -------------------------------------------------
+# Loop through models
+# -------------------------------------------------
+
+for(i in 1:length(models)){
+  
+  model_name <- names(models)[i]
+  
+  fit <- models[[i]]
+  
+  # -----------------------------
+  # TRAIN ROC
+  # -----------------------------
+  
+  train_prob <- fit$prob.group[, "1"]
+  
+  roc_train <- roc(
+    ldata_train$df$y,
+    train_prob
+  )
+  
+  best_threshold <- coords(
+    roc_train,
+    "best",
+    ret = "threshold"
+  )[[1]]
+  
+  # -----------------------------
+  # TEST prediction
+  # -----------------------------
+  
+  test_prob <- predict(
+    fit,
+    ldata_test,
+    type = "prob"
+  )$prob.group[, "1"]
+  
+  roc_test <- roc(
+    ldata_test$df$y,
+    test_prob
+  )
+  
+  auc_val <- as.numeric(
+    auc(roc_test)
+  )
+  
+  auc_values[i] <- auc_val
+  
+  # -----------------------------
+  # ROC line
+  # -----------------------------
+  
+  lines(
+    1 - roc_test$specificities,
+    roc_test$sensitivities,
+    col = colors[i],
+    lwd = 2
+  )
+  
+  # -----------------------------
+  # Best threshold point
+  # -----------------------------
+  
+  best_point <- coords(
+    roc_test,
+    x = best_threshold,
+    input = "threshold",
+    ret = c("specificity","sensitivity")
+  )
+  points(
+    1 - best_point["specificity"],
+    best_point["sensitivity"],
+    pch = 19,
+    col = colors[i]
+  )
+  
+  # -----------------------------
+  # Predicted classes
+  # -----------------------------
+  
+  pred_class <- factor(
+    ifelse(test_prob > best_threshold, 1, 0),
+    levels = c(0,1)
+  )
+  
+  # -----------------------------
+  # Confusion matrix
+  # -----------------------------
+  
+  cm <- confusionMatrix(
+    pred_class,
+    ldata_test$df$y
+  )
+  
+  results[[model_name]] <- cm
+  
+  cat("\n")
+  cat("Model:", model_name, "\n")
+  cat("AUC:", round(auc_val,3), "\n")
+  
+  print(cm)
+}
+
+# -------------------------------------------------
+# Legend
+# -------------------------------------------------
+
+legend(
+  "bottomleft",
+  legend = paste0(
+    names(models),
+    " AUC=",
+    round(auc_values,3)
+  ),
+  col = colors,
+  lwd = 2
+)
+
+# -------------------------------------------------
+# Best model qda
+# -------------------------------------------------
+results
+
+# -------------------------------------------------
+# Confusion matrix plot
+# -------------------------------------------------
+
+cm_df <- as.data.frame(results$QDA$table)
+
+ggplot(cm_df,
+       aes(x = Reference,
+           y = Prediction,
+           fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq),
+            size = 8) +
+              labs(
+                title = paste("Confusion Matrix - QDA model")
+              ) +
+              theme_minimal()
