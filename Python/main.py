@@ -21,6 +21,19 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
 import statsmodels.api as sm
 from patsy import dmatrix
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    roc_curve,
+    auc,
+    confusion_matrix,
+    ConfusionMatrixDisplay
+)
+from sklearn.discriminant_analysis import (
+    LinearDiscriminantAnalysis,
+    QuadraticDiscriminantAnalysis
+)
+from sklearn.tree import DecisionTreeClassifier
 
 # ------------------------------------------------------------------------
 # 1. DATA LOADING
@@ -2098,3 +2111,326 @@ sensitivity = pd.DataFrame({
 
 print("\nSENSITIVITY ANALYSIS")
 print(sensitivity.round(4))
+# ------------------------------------------------------------------------
+# CLASSIFICATION
+# ------------------------------------------------------------------------
+# RESPONSE VARIABLE
+# ------------------------------------------------------------------------
+
+kovariantes_valid["bad_rhythm"] = np.where(
+    kovariantes_valid["Rhythm"] == "AFIB",
+    1,
+    0
+)
+
+y = kovariantes_valid["bad_rhythm"].values
+
+# ------------------------------------------------------------------------
+# FUNCTIONAL DATA
+# ------------------------------------------------------------------------
+
+X_fd = np.asarray(
+    fd_beats.data_matrix
+).squeeze()
+
+# ------------------------------------------------------------------------
+# COVARIATES
+# ------------------------------------------------------------------------
+
+cov_df = pd.DataFrame({
+    "Age": pd.to_numeric(
+        kovariantes_valid["PatientAge"],
+        errors="coerce"
+    ),
+
+    "Gender": kovariantes_valid["Gender"],
+
+    "VenticularRate": pd.to_numeric(
+        kovariantes_valid["VentricularRate"],
+        errors="coerce"
+    ),
+
+    "Arti": pd.to_numeric(
+        kovariantes_valid["AtrialRate"],
+        errors="coerce"
+    )
+})
+
+# ------------------------------------------------------------------------
+# TRAIN / TEST SPLIT
+# ------------------------------------------------------------------------
+
+indices = np.arange(len(y))
+
+train_idx, test_idx = train_test_split(
+    indices,
+    test_size=0.20,
+    stratify=y,
+    random_state=123,
+    shuffle=True
+)
+
+X_fd_train = X_fd[train_idx]
+X_fd_test  = X_fd[test_idx]
+
+y_train = y[train_idx]
+y_test  = y[test_idx]
+
+cov_train = cov_df.iloc[train_idx].reset_index(drop=True)
+cov_test  = cov_df.iloc[test_idx].reset_index(drop=True)
+
+# ------------------------------------------------------------------------
+# FPCA
+# ------------------------------------------------------------------------
+
+fd_train = FDataGrid(
+    data_matrix=X_fd_train,
+    grid_points=beat_grid
+)
+
+fd_test = FDataGrid(
+    data_matrix=X_fd_test,
+    grid_points=beat_grid
+)
+
+fpca = FPCA(n_components=3)
+
+scores_train = fpca.fit_transform(fd_train)
+scores_test = fpca.transform(fd_test)
+
+# ------------------------------------------------------------------------
+# BUILD FEATURE MATRICES
+# ------------------------------------------------------------------------
+
+scores_train_df = pd.DataFrame(
+    scores_train,
+    columns=["PC1", "PC2", "PC3"]
+)
+
+scores_test_df = pd.DataFrame(
+    scores_test,
+    columns=["PC1", "PC2", "PC3"]
+)
+
+X_train = pd.concat(
+    [
+        scores_train_df,
+        cov_train.reset_index(drop=True)
+    ],
+    axis=1
+)
+
+X_test = pd.concat(
+    [
+        scores_test_df,
+        cov_test.reset_index(drop=True)
+    ],
+    axis=1
+)
+
+# ------------------------------------------------------------------------
+# ENCODE GENDER
+# ------------------------------------------------------------------------
+
+X_train = pd.get_dummies(
+    X_train,
+    columns=["Gender"],
+    drop_first=True
+)
+
+X_test = pd.get_dummies(
+    X_test,
+    columns=["Gender"],
+    drop_first=True
+)
+
+# ensure same columns
+X_test = X_test.reindex(
+    columns=X_train.columns,
+    fill_value=0
+)
+
+# ------------------------------------------------------------------------
+# STANDARDIZATION
+# ------------------------------------------------------------------------
+
+scaler = StandardScaler()
+
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# ------------------------------------------------------------------------
+# MODELS
+# ------------------------------------------------------------------------
+
+models = {
+
+    "LDA": LinearDiscriminantAnalysis(),
+
+    "QDA": QuadraticDiscriminantAnalysis(),
+
+    "RPART": DecisionTreeClassifier(
+        random_state=123
+    )
+}
+
+# ------------------------------------------------------------------------
+# ROC PLOT
+# ------------------------------------------------------------------------
+
+plt.figure(figsize=(8, 6))
+
+colors = {
+    "LDA": "red",
+    "QDA": "blue",
+    "RPART": "green"
+}
+
+results = {}
+auc_values = {}
+
+for model_name, model in models.items():
+
+    # ------------------------------------------------------------
+    # FIT
+    # ------------------------------------------------------------
+
+    model.fit(
+        X_train_scaled,
+        y_train
+    )
+
+    # ------------------------------------------------------------
+    # TRAIN ROC
+    # ------------------------------------------------------------
+
+    train_prob = model.predict_proba(
+        X_train_scaled
+    )[:, 1]
+
+    fpr_train, tpr_train, thresh_train = roc_curve(
+        y_train,
+        train_prob,
+        pos_label=1
+    )
+
+    # Youden index (same logic as R pROC::coords(...,"best"))
+    best_idx = np.argmax(
+        tpr_train - fpr_train
+    )
+
+    best_threshold = thresh_train[best_idx]
+
+    # ------------------------------------------------------------
+    # TEST ROC
+    # ------------------------------------------------------------
+
+    test_prob = model.predict_proba(
+        X_test_scaled
+    )[:, 1]
+
+    fpr_test, tpr_test, thresh_test = roc_curve(
+        y_test,
+        test_prob,
+        pos_label=1
+    )
+
+    auc_val = auc(
+        fpr_test,
+        tpr_test
+    )
+
+    auc_values[model_name] = auc_val
+
+    # ------------------------------------------------------------
+    # ROC LINE
+    # ------------------------------------------------------------
+
+    plt.plot(
+        fpr_test,
+        tpr_test,
+        color=colors[model_name],
+        linewidth=2,
+        label=f"{model_name} AUC={auc_val:.3f}"
+    )
+
+    # ------------------------------------------------------------
+    # PREDICTED CLASSES
+    # ------------------------------------------------------------
+
+    pred_class = (
+        test_prob >= best_threshold
+    ).astype(int)
+
+    # ------------------------------------------------------------
+    # CONFUSION MATRIX
+    # ------------------------------------------------------------
+
+    cm = confusion_matrix(
+        y_test,
+        pred_class,
+        labels=[0, 1]
+    )
+
+    results[model_name] = cm
+
+    # ------------------------------------------------------------
+    # PRINT RESULTS
+    # ------------------------------------------------------------
+
+    print("\n")
+    print("MODEL:", model_name)
+    print("AUC:", round(auc_val, 3))
+    print(cm)
+
+# diagonal
+plt.plot(
+    [0, 1],
+    [0, 1],
+    linestyle="--",
+    color="black"
+)
+
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+
+plt.title("ROC curves")
+
+plt.legend()
+
+plt.show()
+
+# ------------------------------------------------------------------------
+# CONFUSION MATRIX — QDA
+# ------------------------------------------------------------------------
+
+cm_qda = results["QDA"]
+
+fig, ax = plt.subplots(figsize=(6, 5))
+
+disp = ConfusionMatrixDisplay(
+    confusion_matrix=cm_qda,
+    display_labels=["0", "1"]
+)
+
+disp.plot(
+    cmap="Blues",
+    ax=ax,
+    colorbar=False
+)
+
+plt.title("Confusion Matrix — QDA model")
+
+plt.show()
+
+# ------------------------------------------------------------------------
+# SUMMARY TABLE
+# ------------------------------------------------------------------------
+
+summary_df = pd.DataFrame({
+    "Model": list(auc_values.keys()),
+    "AUC": list(auc_values.values())
+})
+
+print("\nAUC SUMMARY")
+print(summary_df.round(3))
